@@ -1,0 +1,2 @@
+{"max_gap_m":"15","casts":[{"id":"cast-a","samples":[{"id":"ctd-0","depth_m":"0","temperature_c":"21","salinity_psu":"34"},{"id":"ctd-10","depth_m":"10","temperature_c":"19","salinity_psu":"35"},{"id":"ctd-20","depth_m":"20","temperature_c":"16","salinity_psu":"36"}]}],"bottles":[{"id":"niskin-1","cast_id":"cast-a","depth_m":"5"},{"id":"niskin-2","cast_id":"cast-a","depth_m":"20"},{"id":"niskin-3","cast_id":"cast-a","depth_m":"25"}]}
+
