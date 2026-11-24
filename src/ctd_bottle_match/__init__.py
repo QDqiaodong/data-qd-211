@@ -1,4 +1,3 @@
-from .service import process
+from .service import process, process_with_qc
 
-__all__ = ["process"]
-
+__all__ = ["process", "process_with_qc"]
