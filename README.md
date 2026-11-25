@@ -13,6 +13,7 @@ Python 3.11+。运行依赖仅标准库；构建固定 setuptools 80.9.0 和 whe
     uv pip install --python .venv/bin/python --offline --no-index --no-build-isolation -e .
     .venv/bin/python -m unittest discover -s tests -v
     .venv/bin/python examples/run_sample.py
+    .venv/bin/python examples/run_archive_handoff.py
 
 样例中 5 m 瓶位由 0 m 与 10 m 样本插值得到 20 °C、34.5 PSU；25 m 超出剖面并保留 outside_profile 状态。
 
@@ -33,6 +34,20 @@ Python 3.11+。运行依赖仅标准库；构建固定 setuptools 80.9.0 和 whe
 最大契约规模（100 个航次、100 万样本、5000 瓶）的压力测试可用以下命令开启：
 
     CTD_RUN_STRESS=1 PYTHONPATH=src python3 -m unittest tests.test_qc_stress -v
+
+## 可恢复的归档交接
+
+`ctd_bottle_match.ArchiveHandoff(store_path)` 在本地 JSON 账本上管理科学数据中心的两类交接记录：CTD 来源证据（`sample`）与瓶样关联（`bottle`）。瓶样记录必须等全部来源样本都被 `acknowledge` 确认接收后才能进入交付批次；“已发出”不等于“已接收”。
+
+- `register` 冻结数据集：瓶样 payload 与 `process(data)` 完整行一致（含 `outside_profile`、`gap_too_wide`），只为被引用的样本建立一份 CTD 记录；
+- `next_batch` 支持多个未结批次与记录预留，按 kind、id 排序选择，同请求同 limit 重试原样返回，空批次永久固定；
+- `acknowledge` 支持部分接收：接收的记录落账，其余记录解除预留回到待交付，回执永久固定且可重放；
+- 每次成功操作原子持久化到单个账本文件，`close()` 后新实例或新进程重开只可能看到完整提交前或完整提交后的状态；
+- `inspect` 只读展示 `pending`/`reserved`/`accepted`、瓶样等待的来源 ID 和整体 `complete`。
+
+完整语义见 `docs/contract.md` 第 8 节，可直接运行：
+
+    PYTHONPATH=src python3 examples/run_archive_handoff.py
 
 ## 当前边界
 

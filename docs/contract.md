@@ -4,10 +4,10 @@
 
 本能力把 Niskin 采水瓶的闭合深度关联到同一航次（cast）的 CTD 深度剖面，并在线性插值温度、盐度时使用 Python 标准库 `fractions.Fraction` 完成精确有理数运算。实现不使用第三方依赖或网络服务，不修改输入对象；重复调用同一输入必须得到相等且顺序稳定的结果。
 
-现有公开入口 `ctd_bottle_match.process(data)` 的输入、输出、异常和排序保持兼容。新增公开入口为：
+现有公开入口 `ctd_bottle_match.process(data)` 的输入、输出、异常和排序保持兼容。公开入口为：
 
 ```python
-from ctd_bottle_match import process, process_with_qc
+from ctd_bottle_match import process, process_with_qc, ArchiveHandoff
 ```
 
 契约规模上限：
@@ -232,6 +232,7 @@ CTD_RUN_STRESS=1 PYTHONPATH=src python3 -m unittest tests.test_qc_stress -v
 ```bash
 PYTHONPATH=src python3 examples/run_sample.py
 PYTHONPATH=src python3 examples/run_qc_example.py
+PYTHONPATH=src python3 examples/run_archive_handoff.py
 ```
 
 QC 示例输入见 `fixtures/qc_input.json`。其中 `ctd-10` 在初次匹配后因尖峰被判定无效，导致原本精确命中的 `niskin-qc-10` 改为由 `ctd-0`、`ctd-20` 判定；两端间隔为 `20 m`，超过 `max_gap_m = 12`，因此 final 为 `gap_too_wide`，同时保留失效样本追溯和修订原因：
@@ -258,3 +259,83 @@ QC 示例输入见 `fixtures/qc_input.json`。其中 `ctd-10` 在初次匹配后
 ```
 
 `qc_samples` 中 `ctd-10` 保留 `last_revision_id` 和具体 `reason`，`impact` 记录 `matched -> gap_too_wide`，因此下游实验室既能使用最终质控结果，也能追溯修订原因和受影响瓶样。
+
+## 8. 可恢复的归档交接 `ArchiveHandoff`
+
+科学数据中心分两类接收记录：CTD 来源证据记录（kind 为 `sample`）和瓶样关联记录（kind 为 `bottle`）。“已经发出”不等于“已经接收”：瓶样记录只有在其全部来源样本都已被归档端确认接收后才能进入交付批次。能力只包含 Python 业务 API 和本地持久化账本，不包含命令行、网页、远程上传或真实数据中心，仅使用标准库。
+
+```python
+from ctd_bottle_match import ArchiveHandoff
+
+handoff = ArchiveHandoff(store_path)
+handoff.register(dataset_id, data)
+handoff.next_batch(dataset_id, request_id, limit)
+handoff.acknowledge(dataset_id, request_id, accepted)
+handoff.inspect(dataset_id)
+handoff.close()
+```
+
+`store_path` 是调用方提供的本地文件路径，父目录必须已存在；文件不存在时创建。`close()` 后可以用同一路径新建实例继续，也可以由另一个进程重开。同一存储只要求写操作串行调用，不要求多写者并发；不同 dataset 的交接事实完全隔离。所有 `dataset_id`、`request_id` 必须是非空字符串，`request_id` 在各自 dataset 内唯一、不同 dataset 可重名。非法参数类型、空身份以及 `register` 以外接口引用未知 dataset 都抛出 `ValueError`。所有返回对象和已存储内容都与调用方输入/返回值脱钩，调用方事后修改原数据或返回值不会影响账本。
+
+### 8.1 数据集冻结与记录构造（`register`）
+
+`register(dataset_id, data)` 的 `data` 与 `process` 同契约（`casts`、`bottles`、`max_gap_m`），完整保留既有校验、规模限制和精确有理数规则；若显式包含 `qc_revisions` 字段则直接抛出 `ValueError`，其他未知字段忽略。校验全部成功后才落盘，校验或注册失败不会留下半个数据集，也不影响已存在数据集。同一 `dataset_id` 重复注册一律 `ValueError`，旧进度不可改写或清空。
+
+注册时立即调用一次匹配并冻结结果，后续拉取不再重新解释调用方数据：
+
+- **瓶样记录**：payload 等于 `process(data)` 的完整瓶样行（含 `matched`、`outside_profile`、`gap_too_wide` 全部状态），不能只交付匹配成功的瓶样。
+- **CTD 记录**：只为实际被瓶样行 `source_sample_ids` 引用的样本建立，同一样本只建一份、可支撑多个瓶样；未被引用的剖面样本不参与交接，也不影响完成判断。`matched` 精确命中有一个依赖，插值有两个；`gap_too_wide` 仍交付两个端点样本作为过宽间隔证据，瓶样行不带温盐；`outside_profile` 无来源依赖。
+- CTD payload 形状固定为 `{id, cast_id, depth_m, temperature_c, salinity_psu}`，数值沿用基线精确解析并规范化为整数或最简 `numerator/denominator` 字符串，不允许浮点数。
+- 每条交付记录形状为 `{kind, id, payload}`，kind 只能是 `sample` 或 `bottle`。记录身份是二元组 `(kind, id)`：sample ID 与 bottle ID 可以相同，账本不依赖任何带分隔符的拼接字符串。
+
+返回 `{dataset_id, sample_count, bottle_count}`，数量为实际参加交接的两类记录数（全部瓶样均 `outside_profile` 时 `sample_count` 为 0，数据集仍可正常完成）。
+
+### 8.2 来源确认门槛与未结批次预留（`next_batch`）
+
+`limit` 必须是 1..1000 的整数（布尔值不视为整数）。对首次出现的 `request_id`，在该调用开始时已持久化的接收事实和预留事实下挑选最多 `limit` 条：
+
+- 尚未接收且未被任何未结批次预留的 CTD 记录可以交付；
+- 瓶样记录必须尚未接收、未被预留，并且其全部来源样本都已通过此前成功提交的 `acknowledge` 确认接收；无来源的 `outside_profile` 瓶样可直接交付；
+- 同一批次里即使包含某来源样本，也不能让依赖它的瓶样进入同一批次；其他未结批次中的来源同样不算已接收——必须等下一批次。
+
+合格记录先按 kind（`sample` 在前、`bottle` 在后）、再按各自 id 的 Python 字符串升序选择，批次 items 保持同一顺序；与输入数组位置、瓶深或发出时间无关。
+
+非空批次一旦签发，其中每条记录都为该批次预留，直到该批次被 `acknowledge` 结清。允许同时存在多个未结批次：某个批次等待回执不会阻塞其他未预留 CTD 记录或已满足依赖的瓶样，不存在“每个 dataset 只许一个未结批次”的限制。
+
+### 8.3 重试优先级与空批次
+
+- 同一 `request_id` 以同一 `limit` 重试，原样返回第一次签发的 items、payload 和顺序，即使期间已有接收回执、记录曾被拒收后进入其他批次、或整个数据集已完成；不会重新占用已释放的预留。
+- 同一 `request_id` 改用不同 `limit` 抛出 `ValueError`。
+- 没有合格记录时，签发并永久记录一个 items 为空的批次：空批次自动结清、不预留记录、不阻塞后续请求。之后即使出现新的合格记录，旧请求仍返回原空批次，调用方必须使用新的 `request_id`。
+
+### 8.4 部分回执（`acknowledge`）
+
+`acknowledge(dataset_id, request_id, accepted)` 的 `accepted` 是 `{kind, id}` 数组，可为空，数组顺序不表示业务顺序。完整校验通过后将批次一次性结清：accepted 中的记录成为已接收；批次中其余记录视为本次未接收、解除预留，以后可被新请求再次交付。一次结清覆盖整批，不支持追加确认，也没有过期或自动取消未结批次的机制。
+
+未知 dataset/request、非数组 accepted、非法或重复身份、不属于该批次的身份都抛出 `ValueError`，此时整次操作不生效、不释放任何预留（即使数组里同时包含一个合法身份和一个批次外身份）。
+
+返回 `{dataset_id, request_id, accepted, requeued}`，两个身份数组都按 sample 在前、bottle 在后、id 升序排列，不含 payload。回执永久固定：同一请求用相同 accepted 集合（允许换序）重试，返回第一次回执且不再改动账本；更换集合抛出 `ValueError`。即使旧批次拒收的记录后来已在新批次接收成功，重放旧回执仍返回旧 `requeued`，且不会把这些记录回退成待交付。空批次的 acknowledge 只接受空数组，返回固定空回执。
+
+CTD 的接收确认会实际改变依赖瓶样的交付资格，而不仅是展示字段；瓶样自身未接收时只重交瓶样，不重交其已接收的 CTD 来源。
+
+### 8.5 可观察状态（`inspect`，只读）
+
+返回 `{dataset_id, samples, bottles, open_request_ids, complete}`：
+
+- `samples` 按 id 排序，每项 `{id, state}`，state 为 `pending`、`reserved`（在未结批次中）或 `accepted`；
+- `bottles` 按 id 排序，每项 `{id, state, waiting_for_sample_ids}`：已接收为 `accepted`、被预留为 `reserved`，其余按是否仍有未接收来源分为 `blocked` 或 `pending`；`waiting_for_sample_ids` 始终按该瓶样原 `source_sample_ids` 顺序列出尚未接收的依赖，无依赖或全部已接收时为 `[]`；
+- `open_request_ids` 按字符串升序列出尚未结清的非空批次；
+- `complete` 仅当所有参与交接的 CTD 与瓶样记录都已接收时为 true；全部已发出、暂无可签发记录或仅样本全部接收都不算完成。
+
+### 8.6 持久化与重开恢复
+
+成功返回的注册、批次签发和接收回执都写入本地账本，在 `close()`、对象销毁或另一个进程重开后保持一致，不依赖模块全局对象或调用方内存。每次成功的业务操作对应一次原子持久化边界：业务变化、请求身份绑定和固定返回内容一起生效或一起不生效；实现先在内存快照上执行变更，再以临时文件 + `os.replace` 原子替换账本，持久化失败时回滚内存到上一次已提交状态。因此重开只能看到某次操作完整提交前或完整提交后的状态，不会出现记录被预留但查不到批次、回执已保存但依赖未解锁、或只接收了 accepted 前半部分的中间态。提交已完成但响应未送达时，用同一请求重试取回原结果；尚未提交的失败操作可按当时完整状态重新首次执行。I/O 错误直接向调用方传播，不会伪装成成功。
+
+### 8.7 示例与测试
+
+```bash
+PYTHONPATH=src python3 examples/run_archive_handoff.py
+PYTHONPATH=src python3 -m unittest tests.test_archive_handoff -v
+```
+
+示例展示插值瓶样依赖两个 CTD 端点：只确认一个端点时瓶样保持 `blocked` 不可交付，补齐另一端点确认后新请求才首次交付瓶样，且已接收的来源不会重复发出；流程中包含关闭后由新实例重开账本。
