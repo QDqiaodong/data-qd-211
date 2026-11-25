@@ -420,3 +420,183 @@ def process_with_qc(data: dict) -> dict:
         "qc_samples": qc_samples,
         "impact": impact,
     }
+
+
+# Candidate tuple stored per canonical depth while parsing segments:
+# (sequence, segment_id, sample_index, sample_id, depth, temperature,
+#  salinity, original_sample_dict)
+def _parse_segments_input(data: dict):
+    if not isinstance(data, dict):
+        raise ValueError("input must be an object")
+    max_gap = _fraction(data.get("max_gap_m"), "max_gap_m")
+    segments = data.get("segments")
+    bottles = data.get("bottles")
+    if not isinstance(segments, list) or not 1 <= len(segments) <= 1000:
+        raise ValueError("segments must contain 1..1000 items")
+    if not isinstance(bottles, list) or not 1 <= len(bottles) <= 5000:
+        raise ValueError("bottles must contain 1..5000 items")
+
+    # cast_id -> {"sequences", "segment_order", "sample_count", "depths"} where
+    # depths maps each depth to every segment candidate covering that depth.
+    casts: dict[str, dict] = {}
+    segment_ids: set[str] = set()
+    sample_ids: set[str] = set()
+
+    for segment in segments:
+        if not isinstance(segment, dict):
+            raise ValueError("each segment must be an object")
+        seg_id = segment.get("id")
+        if not isinstance(seg_id, str) or not seg_id or seg_id in segment_ids:
+            raise ValueError("segment ids must be globally unique nonblank strings")
+        cast_id = segment.get("cast_id")
+        if not isinstance(cast_id, str) or not cast_id:
+            raise ValueError("segment cast_id must be a nonblank string")
+        sequence = segment.get("sequence")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
+            raise ValueError("segment sequence must be a positive integer")
+        samples = segment.get("samples")
+        if not isinstance(samples, list) or not 2 <= len(samples) <= 10000:
+            raise ValueError("each segment needs 2..10000 samples")
+
+        cast = casts.get(cast_id)
+        if cast is None:
+            cast = {"sequences": set(), "segment_order": [], "sample_count": 0, "depths": {}}
+            casts[cast_id] = cast
+        if sequence in cast["sequences"]:
+            raise ValueError("segment sequence must be unique within a cast")
+        cast["sequences"].add(sequence)
+        cast["segment_order"].append((sequence, seg_id))
+        cast["sample_count"] += len(samples)
+        if cast["sample_count"] > 10000:
+            raise ValueError("a cast cannot contain more than 10000 samples across its segments")
+        segment_ids.add(seg_id)
+
+        previous = None
+        for sample_index, sample in enumerate(samples):
+            if not isinstance(sample, dict):
+                raise ValueError("each sample must be an object")
+            sample_id = sample.get("id")
+            if not isinstance(sample_id, str) or not sample_id or sample_id in sample_ids:
+                raise ValueError("sample ids must be globally unique nonblank strings")
+            sample_ids.add(sample_id)
+            depth = _fraction(sample.get("depth_m"), "depth_m")
+            temperature = _fraction(sample.get("temperature_c"), "temperature_c")
+            salinity = _fraction(sample.get("salinity_psu"), "salinity_psu")
+            if previous is not None and depth <= previous:
+                raise ValueError("sample depths must be strictly increasing within a segment")
+            previous = depth
+            cast["depths"].setdefault(depth, []).append(
+                (sequence, seg_id, sample_index, sample_id, depth, temperature, salinity, sample)
+            )
+
+    if not 1 <= len(casts) <= 100:
+        raise ValueError("segments must reference 1..100 unique cast ids")
+
+    # Validate every bottle only after the full segment structure is known, so
+    # no business result can be produced before validation completes.
+    parsed_bottles: list[tuple[str, str, Fraction]] = []
+    bottle_ids: set[str] = set()
+    for bottle in bottles:
+        if not isinstance(bottle, dict):
+            raise ValueError("each bottle must be an object")
+        bottle_id = bottle.get("id")
+        if not isinstance(bottle_id, str) or not bottle_id or bottle_id in bottle_ids:
+            raise ValueError("bottle ids must be globally unique nonblank strings")
+        bottle_ids.add(bottle_id)
+        cast_id = bottle.get("cast_id")
+        if not isinstance(cast_id, str) or not cast_id or cast_id not in casts:
+            raise ValueError("bottle cast_id must reference a cast with at least one segment")
+        depth = _fraction(bottle.get("depth_m"), "depth_m")
+        parsed_bottles.append((bottle_id, cast_id, depth))
+
+    return max_gap, casts, parsed_bottles
+
+
+def _build_canonical_profile(cast_id: str, cast: dict) -> dict:
+    segment_ids_sorted = [seg_id for _sequence, seg_id in sorted(cast["segment_order"])]
+    profile: list[tuple[Fraction, Fraction, Fraction, str]] = []
+    depth_values: list[Fraction] = []
+    sample_segments: dict[str, str] = {}
+    canonical_samples: list[dict] = []
+    overlap_resolutions: list[dict] = []
+
+    for depth in sorted(cast["depths"]):
+        # sequence is unique inside a cast, so this order is independent of the
+        # input array position of the segments.
+        candidates = sorted(cast["depths"][depth], key=lambda item: item[0])
+        sequence, seg_id, _index, sample_id, _depth, temperature, salinity, sample = candidates[-1]
+        profile.append((depth, temperature, salinity, sample_id))
+        depth_values.append(depth)
+        sample_segments[sample_id] = seg_id
+        # Rebuild the output row from the caller's original strings so exact
+        # numeric text is never rewritten through Fraction.
+        canonical_samples.append({
+            "id": sample_id,
+            "segment_id": seg_id,
+            "depth_m": sample["depth_m"],
+            "temperature_c": sample["temperature_c"],
+            "salinity_psu": sample["salinity_psu"],
+        })
+        if len(candidates) > 1:
+            overlap_resolutions.append({
+                "depth_m": _text(depth),
+                "selected_sample_id": sample_id,
+                "selected_segment_id": seg_id,
+                "discarded_sample_ids": [candidate[3] for candidate in candidates[:-1]],
+            })
+
+    return {
+        "document": {
+            "cast_id": cast_id,
+            "segment_ids": segment_ids_sorted,
+            "samples": canonical_samples,
+            "overlap_resolutions": overlap_resolutions,
+        },
+        "profile": profile,
+        "depth_values": depth_values,
+        "sample_segments": sample_segments,
+    }
+
+
+def process_with_segments(data: dict) -> dict:
+    # Full validation happens inside the parser; building and matching only
+    # run once every segment, sample and bottle has been accepted.
+    max_gap, casts, parsed_bottles = _parse_segments_input(data)
+
+    canonical: dict[str, dict] = {}
+    canonical_documents = []
+    for cast_id in sorted(casts):
+        built = _build_canonical_profile(cast_id, casts[cast_id])
+        canonical[cast_id] = built
+        canonical_documents.append(built["document"])
+
+    bottle_rows = []
+    counts = {"matched": 0, "outside_profile": 0, "gap_too_wide": 0}
+    for bottle_id, cast_id, depth in parsed_bottles:
+        built = canonical[cast_id]
+        row, status = _match_profile(
+            bottle_id,
+            cast_id,
+            depth,
+            built["profile"],
+            built["depth_values"],
+            max_gap,
+        )
+        if status == "outside_profile":
+            row["source_segment_ids"] = []
+        else:
+            source_segments: list[str] = []
+            for source_sample_id in row["source_sample_ids"]:
+                source_segment_id = built["sample_segments"][source_sample_id]
+                if source_segment_id not in source_segments:
+                    source_segments.append(source_segment_id)
+            row["source_segment_ids"] = source_segments
+        counts[status] += 1
+        bottle_rows.append(row)
+
+    bottle_rows.sort(key=lambda row: row["id"])
+    return {
+        "bottles": bottle_rows,
+        "counts": counts,
+        "canonical_profiles": canonical_documents,
+    }

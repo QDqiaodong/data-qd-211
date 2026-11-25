@@ -34,6 +34,16 @@ Python 3.11+。运行依赖仅标准库；构建固定 setuptools 80.9.0 和 whe
 
     CTD_RUN_STRESS=1 PYTHONPATH=src python3 -m unittest tests.test_qc_stress -v
 
+## 同一航次分段剖面规范化
+
+`ctd_bottle_match.process_with_segments(data)` 处理一次下放被记录器重启、泵重启或分段导出拆成多个 segment 的输入。它先按 `sequence` 把同一 cast 的全部 segment 合并成一条严格递增的 canonical profile：相同深度只保留最大 `sequence` 的样本，被替换样本进入 `overlap_resolutions` 审计，segment 之间的深度空档保留为真实间隔而不外推。随后在 canonical profile 上复用 `process` 的精确插值与状态语义，并在每个瓶样行增加 `source_segment_ids` 追溯实际来源 segment。完整契约见 `docs/contract.md`，示例可运行：
+
+    PYTHONPATH=src python3 examples/run_segments_example.py
+
+分段压力测试（100 个航次、1000 个 segment、每 cast 至多 10000 个样本、5000 瓶）可用以下命令开启：
+
+    CTD_RUN_STRESS=1 PYTHONPATH=src python3 -m unittest tests.test_segment_stress -v
+
 ## 当前边界
 
 当前基线只处理调用方已经整理好的深度剖面，不读取设备二进制、不做传感器漂移校正、不将压力自动换算为深度。质控能力只保存和应用调用方提供的有效/无效及恢复结论，不自动检测尖峰。未来可在 cast/sample/bottle 身份上接入实验室营养盐结果。

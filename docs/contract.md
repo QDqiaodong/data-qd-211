@@ -1,13 +1,13 @@
-# CTD 采水瓶匹配与质控修订契约
+# CTD 采水瓶匹配、质控修订与分段剖面契约
 
 ## 1. 范围与基本约定
 
 本能力把 Niskin 采水瓶的闭合深度关联到同一航次（cast）的 CTD 深度剖面，并在线性插值温度、盐度时使用 Python 标准库 `fractions.Fraction` 完成精确有理数运算。实现不使用第三方依赖或网络服务，不修改输入对象；重复调用同一输入必须得到相等且顺序稳定的结果。
 
-现有公开入口 `ctd_bottle_match.process(data)` 的输入、输出、异常和排序保持兼容。新增公开入口为：
+现有公开入口 `ctd_bottle_match.process(data)` 的输入、输出、异常和排序保持兼容。公开入口为：
 
 ```python
-from ctd_bottle_match import process, process_with_qc
+from ctd_bottle_match import process, process_with_qc, process_with_segments
 ```
 
 契约规模上限：
@@ -225,13 +225,165 @@ from ctd_bottle_match import process, process_with_qc
 CTD_RUN_STRESS=1 PYTHONPATH=src python3 -m unittest tests.test_qc_stress -v
 ```
 
-## 7. 示例
+## 7. 分段剖面入口 `process_with_segments(data)`
+
+CTD 设备在一次下放中可能因记录器重启、泵重启或分段导出，把同一航次保存成多个 segment。每个 segment 内部深度严格递增，但不同 segment 可能覆盖相同深度。`process_with_segments(data)` 先把同一 cast 的全部 segment 规范化成一条 canonical profile，再按第 3 节的既有语义匹配该 cast 的瓶样。该入口不处理质控修订，也不改变 `process`、`process_with_qc` 的输入输出。
+
+### 7.1 分段输入契约
+
+```json
+{
+  "max_gap_m": "12",
+  "segments": [
+    {
+      "id": "seg-a-1",
+      "cast_id": "cast-a",
+      "sequence": 1,
+      "samples": [
+        {"id": "ctd-0", "depth_m": "0", "temperature_c": "21", "salinity_psu": "34"},
+        {"id": "ctd-10-old", "depth_m": "10", "temperature_c": "19", "salinity_psu": "35"}
+      ]
+    },
+    {
+      "id": "seg-a-2",
+      "cast_id": "cast-a",
+      "sequence": 2,
+      "samples": [
+        {"id": "ctd-10-new", "depth_m": "10", "temperature_c": "20", "salinity_psu": "35"},
+        {"id": "ctd-20", "depth_m": "20", "temperature_c": "18", "salinity_psu": "36"}
+      ]
+    }
+  ],
+  "bottles": [
+    {"id": "niskin-1", "cast_id": "cast-a", "depth_m": "15"}
+  ]
+}
+```
+
+`max_gap_m`、深度、温度、盐度沿用第 1 节的有界非负精确数字字符串规则；输出有理数仍只能是整数文本或 `numerator/denominator` 文本。
+
+规模与身份规则：
+
+- `segments` 是 1..1000 个对象；其中唯一 `cast_id` 数量为 1..100，同一 cast 至少有一个 segment；
+- segment `id` 是非空字符串且跨所有 segment 全局唯一；`cast_id` 是非空字符串；`sequence` 是正整数且不是布尔值，同一 cast 内唯一；
+- 每个 segment 的 `samples` 是 2..10000 个对象；同一 cast 的所有 segment 合计样本数不超过 10000；
+- sample `id` 是非空字符串且跨所有 segment 全局唯一；每个 segment 内深度严格递增；
+- `bottles` 是 1..5000 个对象，瓶样 ID 全局唯一且非空；每个瓶样 `cast_id` 必须引用至少一个 segment；
+- 未知字段可以忽略；缺失、类型错误、空身份、重复身份、重复段序、非正整数或布尔段序、越界规模、不满足严格递增等情况抛出明确的 `ValueError`。
+
+全部输入必须在任何匹配、canonical profile 或审计结果产生前校验完毕；校验失败不会返回部分结果。`segments` 数组位置不参与语义，重叠取舍只由同一 cast 内的 `sequence` 决定。
+
+### 7.2 canonical profile 规范化规则
+
+对每个 cast：
+
+1. 不同深度的样本全部保留，按深度升序组成 canonical profile，深度严格递增。
+2. 多个 segment 在同一 cast 出现完全相同深度时，只保留 `sequence` 最大的 segment 中的样本；较大 `sequence` 代表重启后较新、对该重叠点有权威性的记录。同一深度不会因温盐不同而产生两条 canonical 样本，也不会静默平均、取最小值或拼接数值。
+3. 每个保留的 canonical 样本带原始 `sample_id` 与所属 `segment_id`；被替换样本不进入 canonical profile，也不能成为瓶样来源，但必须出现在重叠审计中。
+4. segment 之间没有样本的深度空档保留为 canonical profile 的真实相邻间隔；不会因为 segment 的 `sequence` 相邻就把空档视为连续测量，也不会自动外推。
+5. canonical profile 形成后，瓶样匹配复用第 3 节 `process` 的业务语义：恰好命中 canonical 样本时只引用该样本（`gap_m` 为 `"0"`）；落在相邻样本之间时按 `max_gap_m` 判断并精确有理数插值；越过首尾返回 `outside_profile`；间隔过宽返回 `gap_too_wide`，保留两个 canonical 来源样本和 `gap_m`，不输出温度和盐度。
+
+### 7.3 输出契约
+
+返回对象至少包含 `bottles`、`counts`、`canonical_profiles`。
+
+`canonical_profiles` 按 `cast_id` 升序返回，每个 cast 一项，即使没有重叠也必须出现：
+
+```json
+{
+  "cast_id": "cast-a",
+  "segment_ids": ["seg-a-1", "seg-a-2"],
+  "samples": [
+    {
+      "id": "ctd-0",
+      "segment_id": "seg-a-1",
+      "depth_m": "0",
+      "temperature_c": "21",
+      "salinity_psu": "34"
+    },
+    {
+      "id": "ctd-10-new",
+      "segment_id": "seg-a-2",
+      "depth_m": "10",
+      "temperature_c": "20",
+      "salinity_psu": "35"
+    }
+  ],
+  "overlap_resolutions": [
+    {
+      "depth_m": "10",
+      "selected_sample_id": "ctd-10-new",
+      "selected_segment_id": "seg-a-2",
+      "discarded_sample_ids": ["ctd-10-old"]
+    }
+  ]
+}
+```
+
+- `segment_ids` 按 `sequence` 升序；`samples` 按 canonical 深度升序；`overlap_resolutions` 按深度升序；
+- `samples` 只包含最终选中的样本，字段值与输入完全一致，不输出浮点数、不重写精确数字文本；
+- `discarded_sample_ids` 按未选样本的 `sequence` 升序（同一 segment 内按原始样本顺序）列出该深度全部未选样本；
+- 没有重叠时 `overlap_resolutions` 必须是 `[]`，不得伪造审计记录；仅打乱 `segments` 数组顺序不改变结果，重复调用结果相等。
+
+`bottles` 按瓶样 `id` 升序返回。每行包含第 3 节匹配行的全部字段，并增加：
+
+```json
+"source_segment_ids": ["seg-a-1", "seg-a-2"]
+```
+
+- 按 `source_sample_ids` 的顺序去重得到，来源必须是实际 canonical 样本所属的 segment，不能依据 segment 输入顺序填写，也不能包含被替换样本的 segment；
+- `matched` 与 `gap_too_wide` 使用实际来源 canonical 样本的 segment；`outside_profile` 固定为 `[]`。
+
+`counts` 与 `process` 完全一致，只统计 canonical profile 实际匹配出的 `matched`、`outside_profile`、`gap_too_wide`；分段数、重叠数不会增加或重复计数。
+
+### 7.4 分段入口的复杂度
+
+设 segment 内样本总数为 `S`、瓶样数为 `B`、重叠深度数为 `O`。实现按深度分桶保存候选样本，每个样本只解析一次：
+
+- 解析与校验：`O(S)`；
+- 每个 cast 的 canonical 构建与重叠审计：与该 cast 的样本数及重叠候选数成线性；
+- 每个瓶样在 canonical 深度上二分定位：`O(B log S)`；
+- 不为每个瓶样复制任何 cast 的 canonical profile，也不为每个重叠点重复扫描全部 segment。内存用于保存必要的候选选择、canonical 样本和审计证据。
+
+最大契约规模（100 个 cast、1000 个 segment、每 cast 至多 10000 个样本、5000 瓶）的压力测试默认跳过，可运行：
+
+```bash
+CTD_RUN_STRESS=1 PYTHONPATH=src python3 -m unittest tests.test_segment_stress -v
+```
+
+## 8. 示例
 
 可执行示例：
 
 ```bash
 PYTHONPATH=src python3 examples/run_sample.py
 PYTHONPATH=src python3 examples/run_qc_example.py
+PYTHONPATH=src python3 examples/run_segments_example.py
+```
+
+分段示例输入见 `fixtures/segments_input.json`。其中 10 m 深度同时存在于两个 segment：`sequence = 1` 的 `ctd-10-old`（19 °C）被 `sequence = 2` 的 `ctd-10-new`（20 °C）取代。10 m 瓶样精确命中时只引用新样本及其 segment；15 m 瓶样按新样本与 `ctd-20` 插值，温度为 19 °C、盐度为 `71/2` PSU，来源仍可追溯到 `seg-a-2`；30 m 瓶样落在 20 m 与 40 m 的真实空档之间，间隔 20 m 超过 `max_gap_m = 12`，返回 `gap_too_wide`。重叠审计保留被替换的 `ctd-10-old`：
+
+```json
+{
+  "id": "niskin-10",
+  "cast_id": "cast-a",
+  "depth_m": "10",
+  "status": "matched",
+  "temperature_c": "20",
+  "salinity_psu": "35",
+  "source_sample_ids": ["ctd-10-new"],
+  "gap_m": "0",
+  "source_segment_ids": ["seg-a-2"]
+}
+```
+
+```json
+{
+  "depth_m": "10",
+  "selected_sample_id": "ctd-10-new",
+  "selected_segment_id": "seg-a-2",
+  "discarded_sample_ids": ["ctd-10-old"]
+}
 ```
 
 QC 示例输入见 `fixtures/qc_input.json`。其中 `ctd-10` 在初次匹配后因尖峰被判定无效，导致原本精确命中的 `niskin-qc-10` 改为由 `ctd-0`、`ctd-20` 判定；两端间隔为 `20 m`，超过 `max_gap_m = 12`，因此 final 为 `gap_too_wide`，同时保留失效样本追溯和修订原因：

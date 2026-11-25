@@ -1,0 +1,29 @@
+{
+  "max_gap_m": "12",
+  "segments": [
+    {
+      "id": "seg-a-1",
+      "cast_id": "cast-a",
+      "sequence": 1,
+      "samples": [
+        {"id": "ctd-0", "depth_m": "0", "temperature_c": "21", "salinity_psu": "34"},
+        {"id": "ctd-10-old", "depth_m": "10", "temperature_c": "19", "salinity_psu": "35"}
+      ]
+    },
+    {
+      "id": "seg-a-2",
+      "cast_id": "cast-a",
+      "sequence": 2,
+      "samples": [
+        {"id": "ctd-10-new", "depth_m": "10", "temperature_c": "20", "salinity_psu": "35"},
+        {"id": "ctd-20", "depth_m": "20", "temperature_c": "18", "salinity_psu": "36"},
+        {"id": "ctd-40", "depth_m": "40", "temperature_c": "12", "salinity_psu": "38"}
+      ]
+    }
+  ],
+  "bottles": [
+    {"id": "niskin-10", "cast_id": "cast-a", "depth_m": "10"},
+    {"id": "niskin-15", "cast_id": "cast-a", "depth_m": "15"},
+    {"id": "niskin-30", "cast_id": "cast-a", "depth_m": "30"}
+  ]
+}
